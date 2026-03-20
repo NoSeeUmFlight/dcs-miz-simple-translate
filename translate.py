@@ -1,12 +1,12 @@
 import zipfile
 import re
 import csv
+import os
 from openai import OpenAI
 from tqdm import tqdm
 import argparse
 
-# === Step 0: 设置 API 密钥与提示词 ===
-client = OpenAI(api_key="")
+client = OpenAI(api_key=open(os.path.join(os.path.dirname(__file__), "api_key.txt"), "r", encoding="utf-8").read().strip())
 
 system_prompt = (
     "你是一个了解军事、空军作战体系和术语的领域专家和专业翻译。"

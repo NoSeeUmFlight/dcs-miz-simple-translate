@@ -1,0 +1,5 @@
+# ignore the file contains api key
+api_key.txt
+
+# virtual env dir
+/mizTrans
