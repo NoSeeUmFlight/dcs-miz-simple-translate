@@ -3,18 +3,13 @@
 Translate selected DCS World .miz dictionary entries to Chinese using the OpenAI Responses API.
 
 Key design choices:
-- Uses environment variable OPENAI_API_KEY instead of hard-coding secrets.
+- Reads API key from api_key.txt next to this script.
 - Uses the current Responses API via openai-python.
 - Separates stable instruction, glossary memory, and local candidate context.
 - Avoids blindly stuffing recent translations into one flat prompt.
 - Handles partially disordered mission text by retrieving semantically similar candidates
   from the whole mission instead of trusting file order alone.
-
-Recommended install:
-    pip install -U openai tqdm
-
-Example:
-    python translate_v2_openai.py mission.miz --model gpt-5.4-mini
+- Adds task-type hints and structure-preservation constraints for DCS mission text.
 """
 
 from __future__ import annotations
@@ -23,13 +18,12 @@ import argparse
 import csv
 import difflib
 import json
-import os
 import re
 import sys
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 from openai import OpenAI
 from tqdm import tqdm
@@ -44,8 +38,21 @@ DEFAULT_SYSTEM_PROMPT = """
 
 你的唯一任务是：把给定英文条目翻译成中文，用于 DCS 任务文本本地化。
 
+你处理的条目可能属于下列类型：
+A1. 对话：通常出现在 DictKey_subtitle 中，包含“人物/说话源 + 语言内容”两部分。
+A2. 提示：通常出现在 DictKey_ActionText 中，用于提示玩家操作、状态、结果或任务推进。
+A3. 菜单选项：通常出现在 DictKey_ActionRadioText 中，是玩家在菜单中选择的短句或短词。
+A4. 游戏内背景介绍：可能出现在 DictKey_ActionText 中，是进入游戏后展示的局势、简报、会议场景描述。
+A5. 游戏外背景介绍：通常出现在 DictKey_sortie、DictKey_descriptionBlueTask、DictKey_descriptionNeutralsTask、DictKey_descriptionRedTask、DictKey_descriptionText 中。
+A6. 调试信息：通常出现在 DictKey_ActionText 中，是任务作者调试时使用的字符串；若能明确判断是调试信息，则保持原样，不翻译。
+
+关于 A2 / A4 / A6：
+- 这三类可能共享相同字段，不能只靠字段名判断。
+- 只有在能明确判断条目是调试信息时，才按 A6 处理并保持原样。
+- 如果不能明确判断其为调试信息，必须优先按 A2 或 A4 正常翻译，不能因为怀疑是调试信息就拒绝翻译。
+
 硬性要求：
-1. 只输出译文本身，不要解释，不要加引号，不要加注释。
+1. 只输出最终结果本身，不要解释，不要加引号，不要加注释。
 2. 呼号、人名、机型代号、武器型号、航点代号、频率、激光编码、数字坐标，默认保留原样，除非中文社区已有稳定官方译名。
 3. 军事缩写首次出现时，优先译为“中文（英文缩写）”；如果原句极短、属于无线电喊话或 UI 提示，可只保留缩写或使用更短表达。
 4. 无线电通话应简洁、口语化、符合战术电台语境；任务说明和字幕则可略完整。
@@ -53,14 +60,19 @@ DEFAULT_SYSTEM_PROMPT = """
 6. 若上下文不足以确定人称、指代或术语含义，采取最保守、最不易误导的译法。
 7. 保持同一任务内术语、呼号、地名译法一致。
 8. DCS 官方中文版已有固定译名时，优先与其一致。
+9. 若原文包含“说话人/发话源 + 内容”的结构，必须保留该结构，不得省略说话人、发话源、呼号前缀、尖括号包裹的人物标记、冒号等结构元素。
+10. 若原文中存在类似 “PLAYER: ...”“OVERLORD: ...”“<PLAYER> ...”“Raven2-1, ...” 等发话头、称呼或呼叫对象，它们属于脚本结构的一部分，默认必须保留，不得因为中文习惯而省略。
+11. 你只能翻译可翻译的正文，不得删除原文中可识别的结构性头部。
+12. 候选上下文只用于帮助你判断术语、语气、类型和脚本结构；绝不可把别的条目内容拼进当前译文。
+13. 菜单选项（A3）要简短、可点击；提示（A2）要清楚直接；背景介绍（A4/A5）可稍完整；对话（A1）要保留人物与发话结构。
+14. 如果当前条目被明确标注为“clear_debug_signal=true”，则保持原文不变，原样输出。
 
 你会收到：
 - 当前条目
 - 条目元数据（字段类型、ID）
+- 针对类型和结构的程序分析提示
 - 可能相关的候选上下文（它们不保证顺序正确，只能作为参考）
 - 已累积的术语/记忆表
-
-候选上下文仅供消歧，绝不可把别的条目内容拼进当前译文。
 """.strip()
 
 TARGET_PREFIXES = [
@@ -73,6 +85,14 @@ TARGET_PREFIXES = [
     "DictKey_descriptionNeutralsTask_",
     "DictKey_descriptionText_",
 ]
+
+DESCRIPTION_PREFIXES = {
+    "DictKey_sortie_",
+    "DictKey_descriptionBlueTask_",
+    "DictKey_descriptionRedTask_",
+    "DictKey_descriptionNeutralsTask_",
+    "DictKey_descriptionText_",
+}
 
 
 # =========================
@@ -100,7 +120,6 @@ ENTRY_REGEX = re.compile(
 
 
 def unescape_lua_string(s: str) -> str:
-    """Conservative unescape for DCS dictionary content."""
     s = s.replace(r'\"', '"')
     s = s.replace(r"\\", "\\")
     s = s.replace(r"\n", "\n")
@@ -110,7 +129,6 @@ def unescape_lua_string(s: str) -> str:
 
 
 def escape_for_csv_cell(s: str) -> str:
-    """Preserve line breaks visually for human review in CSV."""
     return s.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\\n")
 
 
@@ -138,10 +156,9 @@ def extract_entries(dictionary_text: str) -> List[Entry]:
 # Context selection helpers
 # =========================
 
-TOKEN_SPLIT_RE = re.compile(r"[A-Za-z0-9']+|\\d+|[A-Z]{2,}|")
 UPPER_TOKEN_RE = re.compile(r"\b[A-Z]{2,}(?:-[A-Z0-9]+)?\b")
-NUMBER_RE = re.compile(r"\b\d{3,5}\b")
-CALLSIGN_RE = re.compile(r"\b[A-Z][A-Za-z]+\s?\d?\b")
+NUMBER_RE = re.compile(r"\b\d{2,5}\b")
+PROPER_TOKEN_RE = re.compile(r"\b[A-Z][a-zA-Z]{2,}\b")
 
 
 def normalize_text(s: str) -> str:
@@ -158,10 +175,9 @@ def extract_anchor_tokens(s: str) -> List[str]:
         anchors.add(m.group(0))
     for m in NUMBER_RE.finditer(s):
         anchors.add(m.group(0))
-    # Callsigns are noisy, so only keep short proper-looking pieces if capitalized standalone.
-    for m in re.finditer(r"\b[A-Z][a-zA-Z]{2,}\b", s):
+    for m in PROPER_TOKEN_RE.finditer(s):
         token = m.group(0)
-        if token.lower() not in {"the", "and", "you", "your", "this", "that"}:
+        if token.lower() not in {"the", "and", "you", "your", "this", "that", "with", "from"}:
             anchors.add(token)
     return sorted(anchors)
 
@@ -171,24 +187,18 @@ def score_candidate(current: Entry, candidate: Entry) -> float:
         return -1.0
 
     score = 0.0
-
-    # Nearby items in file are often useful, but not reliable enough to dominate.
     distance = abs(current.index_in_file - candidate.index_in_file)
     score += max(0.0, 1.5 - 0.08 * distance)
 
-    # Same field family tends to imply similar style.
     if current.prefix == candidate.prefix:
         score += 1.0
 
-    # Exact or partial anchor overlap is very helpful.
     current_anchors = set(extract_anchor_tokens(current.text))
     cand_anchors = set(extract_anchor_tokens(candidate.text))
     overlap = len(current_anchors & cand_anchors)
     score += 1.2 * overlap
 
-    # Text similarity helps when one line asks and another line reminds/repeats.
     score += 2.0 * cheap_similarity(current.text, candidate.text)
-
     return score
 
 
@@ -200,6 +210,160 @@ def select_candidate_contexts(current: Entry, all_entries: Sequence[Entry], k: i
             scored.append((s, candidate))
     scored.sort(key=lambda x: (-x[0], x[1].index_in_file))
     return [entry for _, entry in scored[:k]]
+
+
+# =========================
+# Type / structure hints
+# =========================
+
+COLON_SPEAKER_RE = re.compile(r"^\s*([^:\n<>]{1,40}):\s+(.+)$", re.DOTALL)
+ANGLE_SPEAKER_RE = re.compile(r"^\s*(<[^>]{1,40}>)(\s+.+)$", re.DOTALL)
+CALLSIGN_HEAD_RE = re.compile(r"^\s*([A-Za-z][A-Za-z0-9-]*(?:\s?[0-9]-[0-9])?),\s+(.+)$", re.DOTALL)
+
+DEBUG_PATTERNS = [
+    re.compile(r"\bdebug\b", re.IGNORECASE),
+    re.compile(r"\btest\b", re.IGNORECASE),
+    re.compile(r"\btodo\b", re.IGNORECASE),
+    re.compile(r"\bfixme\b", re.IGNORECASE),
+    re.compile(r"\btemp\b", re.IGNORECASE),
+    re.compile(r"\bdummy\b", re.IGNORECASE),
+    re.compile(r"\btrace\b", re.IGNORECASE),
+    re.compile(r"\blog\b", re.IGNORECASE),
+    re.compile(r"\bflag\s*[:=_-]?\s*\d+\b", re.IGNORECASE),
+    re.compile(r"\btrigger\s*[:=_-]?\s*\d+\b", re.IGNORECASE),
+    re.compile(r"\bstage\s*[:=_-]?\s*\d+\b", re.IGNORECASE),
+    re.compile(r"\bbranch\s*[:=_-]?\s*\d+\b", re.IGNORECASE),
+    re.compile(r"\bcase\s*[:=_-]?\s*\d+\b", re.IGNORECASE),
+    re.compile(r"\bmsg\s*[:=_-]?\s*\d+\b", re.IGNORECASE),
+    re.compile(r"^[A-Z0-9_\- ]{3,}$"),
+]
+
+
+def detect_dialogue_structure(text: str) -> Dict[str, object]:
+    info: Dict[str, object] = {
+        "has_explicit_speaker_structure": False,
+        "structure_kind": "none",
+        "protected_head": "",
+        "translatable_body": text,
+    }
+
+    m = COLON_SPEAKER_RE.match(text)
+    if m:
+        head = m.group(1).strip() + ":"
+        body = m.group(2)
+        info.update(
+            {
+                "has_explicit_speaker_structure": True,
+                "structure_kind": "speaker_colon",
+                "protected_head": head,
+                "translatable_body": body,
+            }
+        )
+        return info
+
+    m = ANGLE_SPEAKER_RE.match(text)
+    if m:
+        head = m.group(1).strip()
+        body = m.group(2).lstrip()
+        info.update(
+            {
+                "has_explicit_speaker_structure": True,
+                "structure_kind": "speaker_angle_brackets",
+                "protected_head": head,
+                "translatable_body": body,
+            }
+        )
+        return info
+
+    m = CALLSIGN_HEAD_RE.match(text)
+    if m:
+        head = m.group(1).strip() + ","
+        body = m.group(2)
+        info.update(
+            {
+                "has_explicit_speaker_structure": True,
+                "structure_kind": "callsign_head",
+                "protected_head": head,
+                "translatable_body": body,
+            }
+        )
+        return info
+
+    return info
+
+
+def is_clearly_debug_actiontext(entry: Entry) -> bool:
+    if entry.prefix != "DictKey_ActionText_":
+        return False
+
+    text = entry.text.strip()
+    if not text:
+        return False
+
+    hits = 0
+    for pat in DEBUG_PATTERNS:
+        if pat.search(text):
+            hits += 1
+
+    if text.startswith("[") and text.endswith("]"):
+        hits += 1
+    if text.startswith("(") and text.endswith(")"):
+        hits += 1
+    if "::" in text or "=>" in text or "==" in text:
+        hits += 1
+
+    return hits >= 2
+
+
+def infer_type_hints(entry: Entry) -> Dict[str, object]:
+    structure = detect_dialogue_structure(entry.text)
+
+    if entry.prefix == "DictKey_subtitle_":
+        return {
+            "possible_types": ["A1"],
+            "recommended_type": "A1",
+            "clear_debug_signal": False,
+            "structure_analysis": structure,
+            "translation_style_hint": "对话字幕；保留人物/发话结构，只翻译正文。",
+        }
+
+    if entry.prefix == "DictKey_ActionRadioText_":
+        return {
+            "possible_types": ["A3"],
+            "recommended_type": "A3",
+            "clear_debug_signal": False,
+            "structure_analysis": structure,
+            "translation_style_hint": "菜单选项；简短、清楚、可点击。",
+        }
+
+    if entry.prefix in DESCRIPTION_PREFIXES:
+        return {
+            "possible_types": ["A5"],
+            "recommended_type": "A5",
+            "clear_debug_signal": False,
+            "structure_analysis": structure,
+            "translation_style_hint": "游戏外背景介绍；可稍完整，偏简报/说明文风格。",
+        }
+
+    clear_debug = is_clearly_debug_actiontext(entry)
+    if clear_debug:
+        return {
+            "possible_types": ["A2", "A4", "A6"],
+            "recommended_type": "A6",
+            "clear_debug_signal": True,
+            "structure_analysis": structure,
+            "translation_style_hint": "已被程序判定为明确调试信息；保持原样输出。",
+        }
+
+    # ActionText 默认不轻易判定为调试信息。
+    longish = len(entry.text.strip()) >= 120 or entry.text.count("\n") >= 2
+    return {
+        "possible_types": ["A2", "A4", "A6"],
+        "recommended_type": "A4" if longish else "A2",
+        "clear_debug_signal": False,
+        "structure_analysis": structure,
+        "translation_style_hint": "ActionText 非明确调试信息；优先按提示或游戏内背景介绍处理。",
+    }
 
 
 # =========================
@@ -219,10 +383,8 @@ class TranslationMemory:
         self._learn_glossary(src, tgt)
 
     def _learn_glossary(self, src: str, tgt: str) -> None:
-        # Learn stable anchors only; keep this conservative.
         for anchor in extract_anchor_tokens(src):
             if anchor in src and anchor not in self.glossary:
-                # If anchor is retained verbatim in target, remember that fact.
                 if anchor in tgt:
                     self.glossary[anchor] = anchor
 
@@ -247,6 +409,7 @@ def build_user_input(current: Entry, candidates: Sequence[Entry], memory: Transl
             "field_name": current.full_key,
             "source_text": current.text,
         },
+        "program_analysis": infer_type_hints(current),
         "reference_glossary": memory.format_glossary_block(),
         "candidate_contexts": [
             {
@@ -254,10 +417,11 @@ def build_user_input(current: Entry, candidates: Sequence[Entry], memory: Transl
                 "field_id": c.field_id,
                 "field_name": c.full_key,
                 "source_text": c.text,
+                "program_analysis": infer_type_hints(c),
             }
             for c in candidates
         ],
-        "output_requirement": "只输出 current_entry.source_text 的中文译文。",
+        "output_requirement": "只输出 current_entry.source_text 的最终结果；若 clear_debug_signal=true，则原样输出 source_text。",
     }
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
@@ -304,6 +468,10 @@ def translate_one(
     if cached is not None:
         return cached
 
+    if is_clearly_debug_actiontext(current):
+        memory.add_translation(current.text, current.text)
+        return current.text
+
     candidates = select_candidate_contexts(current, all_entries, k=6)
     user_input = build_user_input(current, candidates, memory)
 
@@ -314,8 +482,7 @@ def translate_one(
         reasoning={"effort": reasoning_effort},
     )
 
-    translated = extract_output_text(response)
-    translated = translated.strip()
+    translated = extract_output_text(response).strip()
     memory.add_translation(current.text, translated)
     return translated
 
@@ -380,8 +547,6 @@ def main() -> int:
         print("[ERROR] No matching dictionary entries were found.", file=sys.stderr)
         return 1
 
-    # Keep original file order for translation, because nearby entries are still sometimes useful.
-    # For CSV readability, also include sortable numeric metadata.
     memory = TranslationMemory()
     translated_rows: List[List[str | int]] = []
 
@@ -429,6 +594,7 @@ def main() -> int:
                             "index_in_file": entry.index_in_file,
                             "source_text": src,
                             "translated_text": translated,
+                            "program_analysis": infer_type_hints(entry),
                         },
                         ensure_ascii=False,
                     )
