@@ -1,16 +1,28 @@
 @echo off
-REM Drag and drop one or more .miz files onto this BAT to run the Python script.
+setlocal
 
-set SCRIPT_DIR=%~dp0
+set "SCRIPT_DIR=%~dp0"
+set "VENV_DIR=%SCRIPT_DIR%mizTrans"
 
-:loop
-if "%~1"=="" goto end
+if not exist "%VENV_DIR%\Scripts\python.exe" (
+    echo [INFO] Virtual environment mizTrans not found. Creating it...
+    py -m venv "%VENV_DIR%"
+    if errorlevel 1 (
+        echo [ERROR] Failed to create virtual environment.
+        exit /b 1
+    )
+)
 
-REM %~1 = full file path of the dropped file
-python "%SCRIPT_DIR%replace.py" "%~1"
+call "%VENV_DIR%\Scripts\activate.bat"
+if errorlevel 1 (
+    echo [ERROR] Failed to activate virtual environment.
+    exit /b 1
+)
 
-shift
-goto loop
+python "%SCRIPT_DIR%replace.py" %*
+if errorlevel 1 (
+    echo [ERROR] replace.py exited with an error.
+    exit /b 1
+)
 
-:end
-pause
+endlocal
